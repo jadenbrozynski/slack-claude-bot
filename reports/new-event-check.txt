@@ -1,0 +1,33 @@
+You are checking for NEW events created on Eventini in the last 5 minutes.
+
+Firebase Project ID: eventini-746af
+Service Account: /Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json
+Admin SDK setup reference: /Users/jadenbro1/Desktop/eventini-admin/lib/firebase-admin.ts
+
+TASK:
+Write and run a temporary Node.js script that:
+1. Initializes Firebase Admin SDK using the service account
+2. Queries the "eventPlans" collection in Firestore for documents where "createdAt" is within the last 5 minutes
+3. For each new event found, output the event details in this format:
+
+If NO new events found, output exactly: NO_NEW_EVENTS
+
+If new events found, output for each:
+```
+🎉 NEW EVENT CREATED
+
+Event: [event name]
+Type: [event type]
+Date: [event date]
+Host: [host name/email]
+Location: [venue/location if available]
+Expected Guests: [count if available]
+Budget: [if available]
+Status: [status]
+Providers Requested: [count and types]
+Event ID: [document ID]
+
+Created: [timestamp]
+```
+
+IMPORTANT: After running the script, delete it. Only output the event details or NO_NEW_EVENTS, nothing else.

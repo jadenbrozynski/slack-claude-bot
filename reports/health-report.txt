@@ -1,0 +1,105 @@
+You are generating a daily System Health Report for Eventini Engineering. You MUST check real data using CLI tools and produce an accurate report. Do NOT fabricate data.
+
+=== PROJECT PATHS ===
+- EventiniMockUp: /Users/jadenbro1/EventiniMockUp/
+- Marketplace: /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/
+- Admin: /Users/jadenbro1/Desktop/eventini-admin/
+- POS Local: /Users/jadenbro1/EventiniPOS_local/
+- Firebase Project: eventini-746af
+
+=== STEP-BY-STEP INSTRUCTIONS ===
+
+STEP 1 — FIREBASE FUNCTIONS HEALTH:
+Run: `firebase functions:log --project eventini-746af --limit 300 2>&1`
+- Count total errors, warnings, crashes
+- Check for PERMISSION_DENIED (means users are hitting Firestore rule blocks)
+- Check for FAILED_PRECONDITION (means missing Firestore indexes)
+- Check for unhandled promise rejections or OOM crashes
+- Verify scheduled functions are firing (look for entries from checkEventCompletions, autoConfirmHvhEvents, processPendingPayouts, etc.)
+
+STEP 2 — FIRESTORE HEALTH:
+Run: `firebase firestore:indexes --project eventini-746af 2>&1`
+- Verify all indexes are READY (not CREATING or ERROR)
+- Check for any PERMISSION_DENIED errors in the function logs (these mean users hit security rule denials)
+
+STEP 3 — DEPLOYMENT STATUS (run all):
+Run: `cd /Users/jadenbro1/EventiniMockUp && git log --oneline -5 && git status --short 2>&1`
+Run: `cd /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE && git log --oneline -5 && git status --short 2>&1`
+Run: `cd /Users/jadenbro1/Desktop/eventini-admin && git log --oneline -5 && git status --short 2>&1`
+Run: `cd /Users/jadenbro1/EventiniPOS_local && git log --oneline -5 && git status --short 2>&1`
+
+STEP 4 — STRIPE HEALTH:
+Read the Stripe key from /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/.env.local (STRIPE_SECRET_KEY line).
+Run: `curl -s https://api.stripe.com/v1/balance -u "STRIPE_KEY:"` (replace STRIPE_KEY with the actual key)
+- Verify Stripe is responsive and balance is accessible
+- Check for any negative balance
+
+STEP 5 — ACTIVE EVENTS CHECK:
+Write and run a temporary Node.js script using Firebase Admin SDK:
+- Use service account at /Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json
+- Query eventPlans collection for events in the next 48 hours
+- Check if any events need immediate attention (payments due, missing providers, etc.)
+- Delete the script after running
+
+STEP 6 — PAYMENT FAILURES:
+Using the Stripe key, run:
+`curl -s "https://api.stripe.com/v1/charges?limit=50&created[gte]=$(date -v-24H +%s)" -u "STRIPE_KEY:" | python3 -c "import sys,json; data=json.load(sys.stdin); charges=data.get('data',[]); failed=[c for c in charges if c['status']=='failed']; print(f'Total charges: {len(charges)}, Failed: {len(failed)}'); [print(f'  FAILED: {c[\"id\"]} - {c[\"failure_message\"]} - ${c[\"amount\"]/100:.2f}') for c in failed]"`
+
+=== OUTPUT FORMAT ===
+
+```
+🏥 Eventini System Health Report
+[Today's Date] — Operational Status
+Overall: [ALL SYSTEMS GO ✅ / DEGRADED ⚠️ / OUTAGE 🔴]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SYSTEM STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| System | Status | Details |
+|--------|--------|---------|
+| Firebase Functions | ✅/⚠️/🔴 | [error count, crash count] |
+| Firestore DB | ✅/⚠️/🔴 | [index status, permission errors] |
+| Stripe Payments | ✅/⚠️/🔴 | [balance, failed charges] |
+| Marketplace (Vercel) | ✅/⚠️/🔴 | [last deploy, issues] |
+| Admin Dashboard | ✅/⚠️/🔴 | [last deploy] |
+| POS App | ✅/⚠️/🔴 | [last update] |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SCHEDULED TASKS (Last 24h)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Function | Expected | Actual | Status |
+|----------|----------|--------|--------|
+[all 12 scheduled functions]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ERROR SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Permission Denied: [count] — [details if any]
+• Missing Indexes: [count]
+• Function Crashes: [count]
+• Payment Failures: [count] — [details if any]
+• User-Facing Errors: [count]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. UPCOMING EVENTS (Next 48h)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[List events needing attention, or "No events in next 48 hours"]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. RECENT DEPLOYMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EventiniMockUp: [last 3 commits]
+Marketplace: [last 3 commits]
+Admin: [last 3 commits]
+POS: [last 3 commits]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ACTION ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Anything requiring immediate attention — or "No action items"]
+
+Health check by Claude Code — Eventini Engineering
+[Today's Date]
+```
+
+CRITICAL: Every data point must come from actual CLI output. If a tool is unavailable or a command fails, state that clearly rather than guessing.

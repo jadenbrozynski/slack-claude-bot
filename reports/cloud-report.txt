@@ -1,0 +1,124 @@
+You are generating a daily Cloud Functions Report for Eventini Engineering. You MUST check real data using CLI tools and produce an accurate, detailed report. Do NOT make up data — if a command fails, say so.
+
+=== PROJECT PATHS ===
+- EventiniMockUp (Firebase Functions): /Users/jadenbro1/EventiniMockUp/functions/
+- Eventini Marketplace (Next.js API): /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/
+- EventiniPOS Local: /Users/jadenbro1/EventiniPOS_local/
+- Eventini Admin: /Users/jadenbro1/Desktop/eventini-admin/
+- Firebase Project ID: eventini-746af
+
+=== STEP-BY-STEP INSTRUCTIONS (follow exactly) ===
+
+STEP 1 — CLOUD FUNCTION LOGS:
+Run: `firebase functions:log --project eventini-746af --limit 500 2>&1`
+If firebase CLI is not available, try: `gcloud functions logs read --project eventini-746af --limit 500 2>&1`
+Parse the output and categorize:
+- Count total log entries
+- Count ERROR entries (list each with timestamp, function name, error message)
+- Count WARNING entries
+- Look for: PERMISSION_DENIED, FAILED_PRECONDITION, timeout, crash, OOM, unhandled rejection, ECONNREFUSED, DEADLINE_EXCEEDED
+- Look for function cold starts taking >5 seconds
+
+STEP 2 — VERIFY ALL 12 SCHEDULED FUNCTIONS:
+Check the logs for evidence each function fired in the last 24 hours:
+| Function | Schedule | What to look for in logs |
+|----------|----------|--------------------------|
+| checkEventCompletions | every 1 min | Should have ~1440 executions |
+| autoConfirmHvhEvents | every 1 min | Should have ~1440 executions |
+| checkResponseDeadlines | every 5 min | Should have ~288 executions |
+| processPendingPayouts | every 5 min | Should have ~288 executions |
+| sendProviderRequestReminders | every 1 hour | Should have ~24 executions |
+| sendRemainingBalanceReminders | every 1 hour | Should have ~24 executions |
+| sendSalesReportReminders | every 1 hour | Should have ~24 executions |
+| sendEventEditDeadlineReminders | every 1 hour | Should have ~24 executions |
+| sendVenueArrivalInstructions | every 1 hour | Should have ~24 executions |
+| sweepPlatformFees | every 24 hours | Should have 1 execution |
+| sendRequiredDocumentsReminders | every 24 hours | Should have 1 execution |
+| sendVendingFeeReminders | every 24 hours | Should have 1 execution |
+
+Flag any function that did NOT fire or has fewer executions than expected.
+
+STEP 3 — FIRESTORE INDEXES:
+Run: `firebase firestore:indexes --project eventini-746af 2>&1`
+Count total indexes. Check for any in CREATING or ERROR state. List indexes by collection.
+
+STEP 4 — FUNCTION DEPLOYMENT STATUS:
+Run: `firebase functions:list --project eventini-746af 2>&1` or `gcloud functions list --project eventini-746af 2>&1`
+Verify all functions are in ACTIVE/READY state. Flag any in ERROR or UNKNOWN state.
+
+STEP 5 — CHECK MARKETPLACE API:
+Read the last 50 lines of Vercel deployment logs if accessible. Check recent git commits:
+Run: `cd /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE && git log --oneline -10`
+Check for any recent deployments or issues.
+
+STEP 6 — LOOK FOR PATTERNS OF CONCERN:
+- Functions retrying excessively
+- Memory usage approaching limits (512MiB)
+- Latency spikes
+- Firestore quota warnings
+- Any function stuck in a retry loop
+
+=== OUTPUT FORMAT (use exactly this structure) ===
+
+```
+☁️ Cloud Functions Audit Report
+[Today's Date] — 24-Hour Review
+Overall: [HEALTHY ✅ / WARNING ⚠️ / CRITICAL 🔴]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ERROR SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Total Errors: [count]
+Total Warnings: [count]
+[If errors exist, list each: timestamp | function | error message]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SCHEDULED FUNCTIONS STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Function | Schedule | Fires (24h) | Errors | Status |
+|----------|----------|-------------|--------|--------|
+[list all 12 with real data]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. FIRESTORE INDEXES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Active: [count]
+Creating: [count]
+Error: [count]
+[Table by collection]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DEPLOYMENT STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Function deployment status]
+[Recent marketplace commits]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. ITEMS OF CONCERN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Anything unusual, approaching limits, needs investigation]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. RECOMMENDATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| # | Priority | Action |
+|---|----------|--------|
+[numbered list]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Category | Status |
+|----------|--------|
+| Cloud Function Errors | [count] |
+| Permission Denied | [count] |
+| Missing Indexes | [count] |
+| Function Crashes | [count] |
+| Scheduled Tasks | [All OK / X issues] |
+| Marketplace API | [OK / issues] |
+
+Audit by Claude Code — Eventini Engineering
+[Today's Date]
+```
+
+IMPORTANT: Every number in the report must come from actual command output. If a command fails, report what failed and what you could/couldn't verify.

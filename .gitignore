@@ -1,0 +1,7 @@
+.env
+node_modules/
+*.log
+sessions.json
+poll-state.json
+last-charge-ts.txt
+memory/

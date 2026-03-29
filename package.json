@@ -1,0 +1,13 @@
+{
+  "name": "slack-claude-bot",
+  "version": "1.0.0",
+  "description": "Slack bot powered by Claude Code CLI",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.1.0",
+    "node-cron": "^4.2.1"
+  }
+}

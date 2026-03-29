@@ -1,0 +1,180 @@
+You are generating a daily POS & Financial Report for Eventini Engineering. You MUST query real data from the Stripe API and Firebase. Do NOT fabricate numbers.
+
+=== PROJECT PATHS ===
+- EventiniMockUp Functions: /Users/jadenbro1/EventiniMockUp/functions/
+- Marketplace Payment Routes: /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/app/api/
+- Stripe Service Libs: /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/lib/services/
+- Firebase Project: eventini-746af
+- Service Account: /Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json
+
+=== STEP-BY-STEP INSTRUCTIONS ===
+
+STEP 1 — GET STRIPE KEY:
+Read /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/.env.local and extract STRIPE_SECRET_KEY (the sk_live_ key).
+Store it in a variable for all subsequent API calls.
+
+STEP 2 — PLATFORM BALANCE:
+Run: `curl -s https://api.stripe.com/v1/balance -u "STRIPE_KEY:"`
+Parse: available[0].amount (in cents, divide by 100), pending[0].amount
+
+STEP 3 — CHARGES (last 24h):
+Run: `curl -s "https://api.stripe.com/v1/charges?limit=100&created[gte]=$(date -v-24H +%s)" -u "STRIPE_KEY:"`
+For EACH charge, extract: id, amount, status (succeeded/failed/pending), description, metadata (providerId, orgFee, eventiniFee), created timestamp, failure_message if failed, refunded status.
+Count: total, succeeded, failed, refunded. Sum: total volume, failed volume.
+
+STEP 4 — TRANSFERS (last 24h):
+Run: `curl -s "https://api.stripe.com/v1/transfers?limit=100&created[gte]=$(date -v-24H +%s)" -u "STRIPE_KEY:"`
+For EACH transfer, extract: id, amount, destination (connect account), metadata.type (org_fee vs provider_payout), metadata.providerId.
+Categorize: provider payouts vs org fees vs other.
+
+STEP 5 — PAYOUTS (last 24h):
+Run: `curl -s "https://api.stripe.com/v1/payouts?limit=100&created[gte]=$(date -v-24H +%s)" -u "STRIPE_KEY:"`
+List: amount, status, arrival_date, destination.
+
+STEP 6 — REFUNDS (last 24h):
+Run: `curl -s "https://api.stripe.com/v1/refunds?limit=100&created[gte]=$(date -v-24H +%s)" -u "STRIPE_KEY:"`
+List: amount, reason, charge ID, status.
+
+STEP 7 — SWEEP & RESERVE STATUS:
+Check firebase function logs for sweepPlatformFees execution:
+Run: `firebase functions:log --project eventini-746af --only sweepPlatformFees --limit 10 2>&1`
+Read the sweep function at /Users/jadenbro1/EventiniMockUp/functions/index.js (search for "sweepPlatformFees") to understand dynamic reserve calculation.
+
+STEP 8 — PENDING PAYOUTS QUEUE:
+Check: `firebase functions:log --project eventini-746af --only processPendingPayouts --limit 20 2>&1`
+Look for any failed transfers being retried.
+
+STEP 9 — ARCHITECTURE VALIDATION:
+Read these files and verify the protection layers are in place:
+- /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/app/api/stripe-webhook/route.ts — verify source_transaction on transfers
+- /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/app/api/payments/confirm/route.ts — verify balancePaymentTransactionId is stored
+- /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/app/api/order/confirm/route.ts — verify idempotency keys
+
+STEP 10 — PROVIDER/ORG BREAKDOWN:
+Write and run a temp Node.js script with Firebase Admin SDK (service account at /Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json):
+- Query earnings collection for each provider in last 24h
+- Query Organizations collection for org names matched to connect account IDs from transfers
+- Delete the script after
+
+=== OUTPUT FORMAT — TWO SECTIONS separated by ===SPLIT=== ===
+
+SECTION 1:
+```
+💳 Eventini POS & Transaction Health Report
+[Today's Date] — 24-Hour Financial Summary
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. TRANSACTION SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Metric | Count | Volume |
+|--------|-------|--------|
+| Successful Charges | X | $X,XXX.XX |
+| Failed Charges | X | $X,XXX.XX |
+| Refunds Issued | X | $X,XXX.XX |
+| POS (Card Present) | X | $X,XXX.XX |
+| Online Orders | X | $X,XXX.XX |
+| Event Deposits | X | $X,XXX.XX |
+| Tips | X | $X,XXX.XX |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. TRANSFER BREAKDOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Type | Count | Amount |
+|------|-------|--------|
+| Provider Payouts | X | $X,XXX.XX |
+| Organization Fees | X | $X,XXX.XX |
+| Platform Revenue | — | $X,XXX.XX |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. FAILED/DECLINED CHARGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[For each: Charge ID | Amount | Reason | Timestamp]
+[Or: "No failed charges in the last 24 hours ✅"]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. REFUND DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[For each: Refund ID | Amount | Reason | Original Charge]
+[Or: "No refunds in the last 24 hours"]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PENDING PAYOUT QUEUE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Any transfers being retried — or "Queue clear ✅"]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ALERTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Any financial anomalies, unusual patterns, or concerns]
+
+Transaction report by Claude Code — Eventini Engineering
+```
+
+===SPLIT===
+
+SECTION 2:
+```
+💰 Eventini Financial Balance Report
+[Today's Date]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. STRIPE PLATFORM BALANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Category | Amount |
+|----------|--------|
+| Available | $XX.XX |
+| Pending | $XX.XX |
+| Total | $XX.XX |
+
+debit_negative_balances: [TRUE/FALSE]
+Bank on file: BMO ****3597
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PLATFORM FEE SWEEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Last sweep: [datetime]
+Swept amount: $XX.XX
+Dynamic reserve held: $XX.XX
+[Reserve breakdown by upcoming event]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. REVENUE BREAKDOWN (24h)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Source | Eventini Rev | Provider Payout | Org Fee |
+|--------|-------------|-----------------|---------|
+| Event Deposits | $XX.XX | $XX.XX | $XX.XX |
+| POS Sales | $XX.XX | $XX.XX | $XX.XX |
+| Online Orders | $XX.XX | $XX.XX | $XX.XX |
+| Tips | $XX.XX | $XX.XX | N/A |
+| Vending Fees | $XX.XX | N/A | N/A |
+| TOTAL | $XX.XX | $XX.XX | $XX.XX |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. ARCHITECTURE STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Protection Layer | Status |
+|-----------------|--------|
+| source_transaction on transfers | ✅/❌ |
+| balancePaymentTransactionId | ✅/❌ |
+| debit_negative_balances | ✅/❌ |
+| Dynamic sweep reserve | ✅/❌ |
+| processPendingPayouts retry | ✅/❌ |
+| Manual payout schedule | ✅/❌ |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PROVIDER/ORG PAYOUT SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Provider/Org | Role | Earned | Paid | Pending |
+|-------------|------|--------|------|---------|
+[Table of each provider and org with amounts]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. UPCOMING OBLIGATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Events with pending payouts, estimated amounts, due dates]
+
+Financial report by Claude Code — Eventini Engineering
+[Today's Date]
+```
+
+CRITICAL: All dollar amounts MUST come from actual Stripe API responses. Do not estimate or fabricate. If an API call fails, report it as "Unable to retrieve — [error]".

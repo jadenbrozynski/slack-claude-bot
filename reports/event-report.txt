@@ -1,0 +1,123 @@
+You are generating a daily Event Status Report for Eventini Engineering. You MUST query real data from Firestore and produce an accurate report. Do NOT fabricate event data.
+
+=== PROJECT PATHS ===
+- EventiniMockUp: /Users/jadenbro1/EventiniMockUp/
+- Marketplace: /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/
+- Admin: /Users/jadenbro1/Desktop/eventini-admin/
+- Firebase Project: eventini-746af
+- Service Account: /Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json
+- Stripe Key: Read from /Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/.env.local (STRIPE_SECRET_KEY)
+
+=== STEP-BY-STEP INSTRUCTIONS ===
+
+STEP 1 — QUERY ALL EVENTS FROM FIRESTORE:
+Write and run a Node.js script that:
+1. Initialize Firebase Admin SDK:
+```javascript
+const admin = require('firebase-admin');
+const serviceAccount = require('/Users/jadenbro1/Desktop/eventini-admin/firebase-service-account.json');
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
+```
+2. Query the "eventPlans" collection — get ALL documents
+3. For each event, print as JSON: { id, name/title, date, status, hostId, hostName, hostEmail, providers (array with name, service type, status, deadline, stripeConnectAccountId), depositAmount, depositPaid, balanceDue, balancePaid, completionProcessed, reminderProcessed, payoutProcessed, createdAt, location/venue }
+4. Also query "providerRequests" collection for pending requests — get provider name, event name, request status, deadline/expiration
+5. Print all results as JSON, one line per event
+6. Delete the script after running
+
+If firebase-admin is not installed globally, run: `cd /Users/jadenbro1/Desktop/eventini-admin && node -e "..."` (since that project has firebase-admin in node_modules)
+
+STEP 2 — CALCULATE EVENT TIMELINES:
+For each event:
+- Days until event (or days since if past)
+- If providers have pending requests: time remaining to accept/decline
+- If deposit unpaid: urgency level
+- If event is within 7 days: flag as "APPROACHING"
+
+STEP 3 — ESTIMATE PAYOUTS:
+For events with confirmed providers, read the payout logic:
+- Read /Users/jadenbro1/EventiniMockUp/functions/index.js — search for "processProviderPayout" to understand payout calculation
+- For each provider on each event: estimate payout based on deposit amount, service fees, etc.
+- Use Stripe API to check if any transfers already exist for the event's charges
+
+STEP 4 — CHECK COMPLETION STATUS:
+For completed events, verify:
+- completionProcessed flag is set
+- reminderProcessed flag is set
+- Payouts were sent to all providers
+- No stuck events (completed but not processed)
+
+STEP 5 — PROVIDER REQUEST DEADLINES:
+Check the checkResponseDeadlines function in /Users/jadenbro1/EventiniMockUp/functions/index.js (around line 6673):
+- Understand what happens when a deadline expires
+- Check for any requests expiring in the next 24 hours
+
+=== OUTPUT FORMAT ===
+
+```
+📅 Eventini Event Status Report
+[Today's Date] — Daily Event Update
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. EVENTS OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Total | Upcoming | In Progress | Completed | Cancelled |
+|-------|----------|-------------|-----------|-----------|
+| X | X | X | X | X |
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. UPCOMING EVENTS (Chronological)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[For EACH upcoming event:]
+
+🎪 [Event Name] — [Event Type]
+📆 Date: [date] ([X days away])
+👤 Host: [name]
+📍 Location: [venue]
+💵 Deposit: [PAID ✅ $XXX / UNPAID ❌ $XXX due]
+💰 Balance: [PAID ✅ / $XXX remaining — due by (date)]
+🤝 Providers:
+| Provider | Service | Status | Deadline | Est. Payout |
+|----------|---------|--------|----------|-------------|
+[list each]
+⚠️ Flags: [any issues, or "None"]
+---
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. PENDING PROVIDER REQUESTS ⏰
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Sorted by deadline urgency — most urgent first]
+| Provider | Event | Request Sent | Deadline | Time Left | Status |
+|----------|-------|-------------|----------|-----------|--------|
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. RECENTLY COMPLETED EVENTS (Last 7 Days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Event | Date | Providers Paid | Total Payouts | Flags |
+|-------|------|---------------|---------------|-------|
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. EVENT LIFECYCLE FLAGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| Event | completionProcessed | reminderProcessed | payoutProcessed | Issue |
+|-------|--------------------|--------------------|-----------------|-------|
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. REVENUE FORECAST (Next 30 Days)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Confirmed bookings: X events
+Estimated platform revenue: $X,XXX
+Estimated provider payouts: $X,XXX
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. ACTION ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+| # | Priority | Action |
+|---|----------|--------|
+[numbered list — or "No action items"]
+
+Event report by Claude Code — Eventini Engineering
+[Today's Date]
+```
+
+CRITICAL: All event data must come from actual Firestore queries. If the query fails, report what failed. Never make up event names, dates, or amounts.
