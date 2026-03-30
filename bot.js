@@ -53,20 +53,15 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const marketplaceEnv =
-  "/Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/.env.local";
-let STRIPE_KEY = "";
-if (fs.existsSync(marketplaceEnv)) {
-  for (const line of fs.readFileSync(marketplaceEnv, "utf8").split("\n")) {
-    const match = line.match(/^STRIPE_SECRET_KEY=(.*)$/);
-    if (match) STRIPE_KEY = match[1].trim();
-  }
-}
 
 const CLAUDE_PATH = "/Users/jadenbro1/.local/bin/claude";
 const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 const MEMORY_DIR = path.join(__dirname, "memory");
 const TEMP_DIR = path.join(os.tmpdir(), "slack-claude-bot");
+
+// Model tiering — save tokens by using cheaper models where possible
+const MODEL_HAIKU = "claude-haiku-4-5-20251001";
+const MODEL_SONNET = "claude-sonnet-4-6-20250819";
 
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -375,25 +370,29 @@ function enqueueClaude(fn) {
 // CLAUDE CLI RUNNER
 // ============================================================
 
-function runClaude(prompt, sessionKey, timeoutMs = 600000, cwd = null) {
+function runClaude(prompt, sessionKey, timeoutMs = 600000, cwd = null, opts = {}) {
   return enqueueClaude(() =>
-    _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, false)
+    _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, false, opts)
   );
 }
 
-function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry) {
+function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = {}) {
   return new Promise((resolve, reject) => {
     const existingSession =
       sessionKey && !isRetry ? getSessionId(sessionKey) : null;
 
+    const tools = opts.tools || "Bash,Read,Write,Edit,Glob,Grep";
     const args = [
       "-p",
       prompt,
       "--allowedTools",
-      "Bash,Read,Write,Edit,Glob,Grep",
+      tools,
       "--output-format",
       "json",
     ];
+
+    if (opts.model) args.push("--model", opts.model);
+    if (opts.maxTurns) args.push("--max-turns", String(opts.maxTurns));
 
     if (existingSession) {
       args.push("--resume", existingSession);
@@ -458,7 +457,7 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry) {
               `Session resume failed for ${sessionKey}, starting fresh`
             );
             clearSession(sessionKey);
-            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true)
+            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true, opts)
               .then(resolve)
               .catch(reject);
             return;
@@ -476,7 +475,7 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry) {
               `Session resume failed for ${sessionKey} (code ${code}), starting fresh`
             );
             clearSession(sessionKey);
-            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true)
+            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true, opts)
               .then(resolve)
               .catch(reject);
             return;
@@ -499,47 +498,18 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry) {
 // SYSTEM PROMPTS
 // ============================================================
 
-const FORMATTING_RULES = `FORMATTING RULES (you are posting to Slack, NOT a terminal):
-- Bold: *single asterisks* (NEVER **double**)
-- Italic: _underscores_
-- Code: \`backticks\` / \`\`\`code blocks\`\`\`
-- NO markdown tables (| column |). Use code blocks or bullet lists.
-- NO markdown headings (# ##). Use *bold text* on its own line.
-- Links: <https://url|text> (NOT [text](url))
-- Lists: use bullet points (•) not dashes (-)
-- NO emojis except ✅ for success/pass and ❌ for failure/error. Do not use ANY other emojis.
-- Keep responses concise and well-structured for Slack readability.
-- For tabular data, use \`\`\`code blocks\`\`\` with aligned columns.`;
+const FORMATTING_RULES = `SLACK FORMATTING: *bold* (not **), _italic_, \`code\`, \`\`\`blocks\`\`\`. No markdown tables/headings. Links: <url|text>. Bullets: •. Only emojis: ✅ ❌. Be concise.`;
 
 function buildSystemPrompt(channelId) {
   const channelName = CHANNEL_NAMES[channelId] || "direct-message";
   const channelMemPath = ensureChannelMemory(channelId);
 
-  return `You are EventiniClaw, the Eventini engineering assistant running in Slack.
-
-CHANNEL: #${channelName}
-
-KEY CONTEXT:
-- Eventini is an event planning marketplace connecting hosts with providers (food, beverage, entertainment, venues, etc.)
-- Projects on this machine:
-  • EventiniMockUp (/Users/jadenbro1/EventiniMockUp/) — React Native/Expo mobile app + Firebase Cloud Functions
-  • EVENTINI-MARKETPLACE (/Users/jadenbro1/Desktop/EVENTINI-MARKETPLACE/) — Next.js marketplace web app on Vercel
-  • eventini-admin (/Users/jadenbro1/Desktop/eventini-admin/) — Next.js admin dashboard
-  • EventiniPOS_local (/Users/jadenbro1/EventiniPOS_local/) — React Native POS app for providers
-  • Pina-Eventini (/Users/jadenbro1/Pina-Eventini/) — Vite React web app
-- Firebase Project: eventini-746af
-- Payment processing: Stripe Connect
-
-MEMORY SYSTEM:
-You have persistent memory files. Read them at the start of each new conversation for context:
-- Global memory: ${GLOBAL_MEMORY}
-- This channel's memory: ${channelMemPath}
-After completing a significant task or learning important context, UPDATE the relevant memory file using the Edit or Write tool.
-Channel memory should track: what you've worked on, decisions made, current state, and key context from conversations.
-
+  return `You are EventiniClaw, Eventini's engineering assistant in Slack (#${channelName}).
+Eventini = event planning marketplace (hosts + providers). Firebase: eventini-746af. Stripe Connect.
+Projects: EventiniMockUp (RN mobile), EVENTINI-MARKETPLACE (Next.js/Vercel), eventini-admin (Next.js), EventiniPOS_local (RN POS), Pina-Eventini (Vite).
+Memory: read ${GLOBAL_MEMORY} and ${channelMemPath} for context. Update after significant tasks.
 ${FORMATTING_RULES}
-
-IMPORTANT: Always answer directly. Never say you can't help. You have full system access — use it.`;
+Answer directly. Full system access.`;
 }
 
 function buildBuilderSystemPrompt(config) {
@@ -549,48 +519,15 @@ function buildBuilderSystemPrompt(config) {
     ) || ""
   );
 
-  return `You are EventiniClaw, a senior full-stack engineer working on the ${config.projectName} project.
-
-PROJECT PATH: ${config.projectPath}
-
+  return `You are EventiniClaw, senior full-stack engineer on ${config.projectName}.
+Path: ${config.projectPath}. Memory: ${GLOBAL_MEMORY}, ${channelMemPath}. Read for context, update after tasks.
 ${FORMATTING_RULES}
-
-MEMORY SYSTEM:
-- Global memory: ${GLOBAL_MEMORY}
-- Channel memory: ${channelMemPath}
-Read these for context. Update channel memory after completing tasks.
-
-CAPABILITIES:
-- You can read, edit, and create files in ${config.projectPath}
-- You can run git commands (add, commit, push)
-- You can run build/deploy commands
-${config.vercel ? "- Deploy to Vercel: npx vercel --prod --yes" : ""}
-${config.appStore ? "- Deploy to TestFlight: bundle exec fastlane beta" : ""}
-
-WORKFLOW:
-1. When asked to make changes: edit files, then \`git add -A && git commit -m "description"\` (local only)
-2. When asked to push: \`git push\`${config.vercel ? " then \`npx vercel --prod --yes\`" : ""}
-3. When asked to deploy to app store: bump version, \`yarn install && cd ios && pod install\`, then \`bundle exec fastlane beta\`
-
-After completing work, tell the user what you did and what the next steps are:
-${config.vercel ? '• *"push"* to push to remote and deploy to Vercel' : '• *"push"* to push to remote'}
-${config.appStore ? '• *"deploy to testflight"* to build and upload to TestFlight' : ""}
-
-IMPORTANT: Make clean, production-quality edits. Do not break existing functionality.`;
+Can: read/edit/create files, git add/commit/push.${config.vercel ? " Deploy: npx vercel --prod --yes." : ""}${config.appStore ? " TestFlight: bundle exec fastlane beta." : ""}
+Workflow: edit -> git add -A && git commit -> tell user to "push".${config.appStore ? ' Or "deploy to testflight".' : ""}
+Make clean, production-quality edits.`;
 }
 
-// Slack formatting instruction for reports
-const SLACK_FORMAT_RULE = `CRITICAL: Your output will be posted directly to Slack. Use Slack mrkdwn formatting:
-- Bold: *single asterisks* (NOT **double**)
-- Italic: _underscores_
-- Code: \`backticks\` / \`\`\`code blocks\`\`\`
-- NEVER use markdown tables (| col |). Use \`\`\`code blocks\`\`\` with aligned columns.
-- NEVER use # headings. Use *bold text* on its own line.
-- Links: <https://url|text> NOT [text](url)
-- NO emojis except ✅ for success/pass and ❌ for failure/error. Do not use ANY other emojis whatsoever.
-- Use bullet points (•) not dashes (-)
-
-`;
+const SLACK_FORMAT_RULE = `Output goes directly to Slack. ${FORMATTING_RULES}\n\n`;
 
 // Load report prompts
 function loadPrompt(name) {
@@ -742,123 +679,9 @@ const app = new App({
 // Store our own bot user ID to strip from messages
 let botUserId = null;
 
-// ============================================================
-// REAL-TIME TRANSACTION LOGGER
-// ============================================================
-
-const seenCharges = new Set();
-const TRANSACTION_LOG_FILE = path.join(__dirname, "last-charge-ts.txt");
-
-function getLastCheckTime() {
-  try {
-    return parseInt(fs.readFileSync(TRANSACTION_LOG_FILE, "utf8").trim());
-  } catch {
-    return Math.floor(Date.now() / 1000) - 60;
-  }
-}
-
-function saveLastCheckTime(ts) {
-  fs.writeFileSync(TRANSACTION_LOG_FILE, String(ts));
-}
-
-function stripeGet(endpoint) {
-  return new Promise((resolve, reject) => {
-    if (!STRIPE_KEY) return reject(new Error("No Stripe key"));
-    const url = new URL(`https://api.stripe.com/v1${endpoint}`);
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      headers: { Authorization: `Bearer ${STRIPE_KEY}` },
-    };
-    https
-      .get(options, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            reject(new Error("Invalid JSON from Stripe"));
-          }
-        });
-      })
-      .on("error", reject);
-  });
-}
-
-async function checkNewTransactions() {
-  try {
-    const since = getLastCheckTime();
-    const now = Math.floor(Date.now() / 1000);
-
-    const data = await stripeGet(
-      `/charges?limit=20&created[gt]=${since}&expand[]=data.transfer_group`
-    );
-
-    if (!data.data || data.data.length === 0) {
-      saveLastCheckTime(now);
-      return;
-    }
-
-    for (const charge of data.data.reverse()) {
-      if (seenCharges.has(charge.id)) continue;
-      seenCharges.add(charge.id);
-
-      if (seenCharges.size > 500) {
-        const arr = [...seenCharges];
-        arr.splice(0, 250);
-        seenCharges.clear();
-        arr.forEach((id) => seenCharges.add(id));
-      }
-
-      const amount = (charge.amount / 100).toFixed(2);
-      const status = charge.status;
-      const meta = charge.metadata || {};
-      const eventiniFee = meta.eventiniFee
-        ? (parseInt(meta.eventiniFee) / 100).toFixed(2)
-        : "0.00";
-      const orgFee = meta.orgFee
-        ? (parseInt(meta.orgFee) / 100).toFixed(2)
-        : "0.00";
-      const providerId = meta.providerId || "Unknown";
-      const providerAmount = (
-        charge.amount / 100 -
-        parseFloat(eventiniFee) -
-        parseFloat(orgFee)
-      ).toFixed(2);
-
-      const statusEmoji =
-        status === "succeeded" ? "✅" : status === "failed" ? "❌" : "Pending";
-
-      const time = new Date(charge.created * 1000).toLocaleTimeString(
-        "en-US",
-        { timeZone: "America/Chicago", hour: "2-digit", minute: "2-digit" }
-      );
-
-      const msg = [
-        `${statusEmoji} *$${amount}* — ${status.toUpperCase()}`,
-        `${time}`,
-        `Provider: \`${providerId}\``,
-        `Provider: $${providerAmount} | Org Fee: $${orgFee} | Eventini Fee: $${eventiniFee}`,
-        charge.description ? charge.description : null,
-        status === "failed" ? `Failure: ${charge.failure_message}` : null,
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      await app.client.chat.postMessage({
-        channel: CHANNELS["transaction-log"],
-        text: msg,
-      });
-    }
-
-    saveLastCheckTime(now);
-  } catch (err) {
-    logError("Transaction check error:", err.message);
-  }
-}
-
-setInterval(checkNewTransactions, 30000);
+// Transaction logging is now handled by Firebase Cloud Functions (stripeWebhook)
+// Events are now handled by Firestore triggers (notifySlackOnNewEvent)
+// No more polling — real-time via webhooks
 
 // ============================================================
 // SCHEDULED REPORTS — Daily at 8am
@@ -883,8 +706,12 @@ async function runScheduledReport(reportName) {
     });
 
     const prompt = loadPrompt(reportName);
-    // Reports are stateless — no session key (fresh each time)
-    const response = await runClaude(prompt, null, 600000);
+    // Reports: sonnet + max 5 turns, read-only tools
+    const response = await runClaude(prompt, null, 600000, null, {
+      model: MODEL_SONNET,
+      maxTurns: 5,
+      tools: "Bash,Read,Glob,Grep",
+    });
 
     if (reportName === "pos-report" && response.includes("===SPLIT===")) {
       const [section1, section2] = response.split("===SPLIT===");
@@ -904,6 +731,12 @@ async function runScheduledReport(reportName) {
   }
 }
 
+// Clear all sessions daily at 7:50am — prevents context from ballooning over days
+cron.schedule("50 7 * * *", () => {
+  fs.writeFileSync(SESSIONS_FILE, "{}");
+  log("Sessions cleared for new day");
+});
+
 cron.schedule("0 8 * * *", () => {
   setTimeout(() => runScheduledReport("health-report"), 0);
   setTimeout(() => runScheduledReport("cloud-report"), 3 * 60 * 1000);
@@ -911,27 +744,8 @@ cron.schedule("0 8 * * *", () => {
   setTimeout(() => runScheduledReport("event-report"), 9 * 60 * 1000);
 });
 
-// ============================================================
-// NEW EVENT CHECKER — Every 15 minutes (was 5, reduced to avoid overload)
-// ============================================================
-
-cron.schedule("*/15 * * * *", async () => {
-  try {
-    const prompt = loadPrompt("new-event-check");
-    // No session — stateless check, 3 min timeout
-    const response = await runClaude(prompt, null, 180000);
-
-    if (response && !response.includes("NO_NEW_EVENTS")) {
-      await postToChannel(app.client, CHANNELS["event-report"], response);
-      log(
-        `[${new Date().toISOString()}] New event detected and posted`
-      );
-    }
-  } catch (err) {
-    // Silently log — don't spam Slack with background check errors
-    logError("New event check failed:", err.message);
-  }
-});
+// New event detection is now handled by Firebase Cloud Functions (notifySlackOnNewEvent)
+// No more Claude-powered polling — Firestore trigger fires instantly on event creation
 
 // ============================================================
 // /report COMMAND
@@ -1072,7 +886,8 @@ async function handleMessage(event, client) {
         prompt,
         sessionKey,
         600000,
-        builder.projectPath
+        builder.projectPath,
+        {} // Builder uses default model (Opus) for code quality
       );
       await reply(response);
     } catch (err) {
@@ -1151,7 +966,11 @@ async function handleMessage(event, client) {
     });
     try {
       const customPrompt = `${buildSystemPrompt(channel)}\n\nThe user wants a custom report. Generate it based on their request:\n\n${text}`;
-      const response = await runClaude(customPrompt, `custom:${channel}`);
+      const response = await runClaude(customPrompt, `custom:${channel}`, 600000, null, {
+        model: MODEL_SONNET,
+        maxTurns: 5,
+        tools: "Bash,Read,Glob,Grep",
+      });
       await reply(response);
     } catch (err) {
       await reply(`❌ Custom report failed: ${err.message}`);
@@ -1185,7 +1004,9 @@ async function handleMessage(event, client) {
       ? text
       : `${buildSystemPrompt(channel)}\n\nUser message: ${text}`;
 
-    const response = await runClaude(prompt, sessionKey);
+    const response = await runClaude(prompt, sessionKey, 600000, null, {
+      model: MODEL_SONNET,
+    });
     await reply(response);
   } catch (err) {
     logError("Claude error:", err.message);
@@ -1374,45 +1195,14 @@ setInterval(pollNextChannel, 1000);
   // Initialize polling state
   await initPollState();
 
-  checkNewTransactions();
-
   log("");
   log("EventiniClaw Slack Bot is running!");
   log("  Powered by Claude Code CLI");
-  log("  Working directory: " + os.homedir());
   log("");
-  log("  Daily Reports (8:00 AM):");
-  log("    health-report  -> #health-report");
-  log("    cloud-report   -> #cloud-report   (+3 min)");
-  log("    pos-report     -> #pos-report     (+6 min)");
-  log("    event-report   -> #event-report   (+9 min)");
-  log("");
-  log(
-    "  Transaction Log: real-time -> #transaction-log (every 30s)"
-  );
-  log("  New Event Check: every 15 min -> #event-report");
-  log("");
-  log("  Builder Channels:");
-  log(
-    "    #marketplace-builder -> EVENTINI-MARKETPLACE (edit + push + vercel)"
-  );
-  log(
-    "    #admin-builder       -> eventini-admin (edit + push + vercel)"
-  );
-  log(
-    "    #app-builder         -> EventiniMockUp (edit + push + TestFlight)"
-  );
-  log(
-    "    #pos-app             -> EventiniPOS Local (edit + push + TestFlight)"
-  );
-  log("");
-  log("  Message polling: every 1.5s per channel (~13s full cycle)");
-  log("  Session management: persistent per-channel (sessions.json)");
-  log("  Memory: per-channel markdown files (memory/)");
-  log("  Concurrency: max 2 Claude processes at once");
-  log("");
-  log(
-    `  Stripe: ${STRIPE_KEY ? "Loaded" : "NOT FOUND"}`
-  );
+  log("  Daily Reports (8:00 AM) — Sonnet, max 5 turns");
+  log("  Transactions — Firebase webhook (zero Claude tokens)");
+  log("  New Events — Firestore trigger (zero Claude tokens)");
+  log("  Chat/Builder — Sonnet");
+  log("  Sessions auto-clear daily at 7:50 AM");
   log("");
 })();
