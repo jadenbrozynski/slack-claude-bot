@@ -60,8 +60,8 @@ const MEMORY_DIR = path.join(__dirname, "memory");
 const TEMP_DIR = path.join(os.tmpdir(), "slack-claude-bot");
 
 // Model tiering — save tokens by using cheaper models where possible
-const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const MODEL_SONNET = "claude-sonnet-4-6-20250819";
+const MODEL_HAIKU = "haiku";
+const MODEL_SONNET = "sonnet";
 
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
