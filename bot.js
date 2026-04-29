@@ -42,6 +42,48 @@ function logError(...args) {
 }
 
 // ============================================================
+// SINGLE-INSTANCE LOCK (prevents duplicate processes)
+// ============================================================
+
+const LOCK_FILE = path.join(__dirname, "bot.lock");
+
+function acquireLock() {
+  try {
+    // Check if lock file exists and if the PID in it is still alive
+    if (fs.existsSync(LOCK_FILE)) {
+      const oldPid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
+      if (oldPid) {
+        try {
+          process.kill(oldPid, 0); // signal 0 = just check if alive
+          console.error(`Another bot instance is already running (PID ${oldPid}). Exiting.`);
+          process.exit(1);
+        } catch {
+          // Old process is dead — stale lock, we can take over
+        }
+      }
+    }
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
+  } catch (err) {
+    console.error("Failed to acquire lock:", err.message);
+    process.exit(1);
+  }
+}
+
+function releaseLock() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, "utf8").trim(), 10);
+      if (pid === process.pid) fs.unlinkSync(LOCK_FILE);
+    }
+  } catch {}
+}
+
+acquireLock();
+process.on("exit", releaseLock);
+process.on("SIGINT", () => { releaseLock(); process.exit(0); });
+process.on("SIGTERM", () => { releaseLock(); process.exit(0); });
+
+// ============================================================
 // CONFIG & SETUP
 // ============================================================
 
@@ -163,7 +205,11 @@ const BUILDER_CHANNELS = {
 
 // ============================================================
 // SESSION MANAGEMENT (persisted to disk)
+// Sessions auto-rotate after MAX_SESSION_MESSAGES to prevent context bloat
 // ============================================================
+
+const MAX_SESSION_MESSAGES = 20; // Start fresh session after this many messages
+const SESSION_COUNTS_FILE = path.join(__dirname, "session-counts.json");
 
 function loadSessions() {
   try {
@@ -177,6 +223,18 @@ function saveSessions(sessions) {
   fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
 }
 
+function loadSessionCounts() {
+  try {
+    return JSON.parse(fs.readFileSync(SESSION_COUNTS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveSessionCounts(counts) {
+  fs.writeFileSync(SESSION_COUNTS_FILE, JSON.stringify(counts));
+}
+
 function getSessionId(key) {
   return loadSessions()[key] || null;
 }
@@ -187,10 +245,26 @@ function setSessionId(key, id) {
   saveSessions(s);
 }
 
+function incrementSessionCount(key) {
+  const counts = loadSessionCounts();
+  counts[key] = (counts[key] || 0) + 1;
+  saveSessionCounts(counts);
+  return counts[key];
+}
+
+function shouldRotateSession(key) {
+  const counts = loadSessionCounts();
+  return (counts[key] || 0) >= MAX_SESSION_MESSAGES;
+}
+
 function clearSession(key) {
   const s = loadSessions();
   delete s[key];
   saveSessions(s);
+  // Also reset the message count
+  const counts = loadSessionCounts();
+  delete counts[key];
+  saveSessionCounts(counts);
 }
 
 // ============================================================
@@ -367,28 +441,62 @@ function enqueueClaude(fn) {
 }
 
 // ============================================================
+// PER-CHANNEL BUSY TRACKING
+// Prevents new Claude processes from starting while one is already running
+// for the same channel. Queues the latest pending message instead.
+// ============================================================
+
+const busyChannels = new Set();
+const pendingMessages = new Map(); // channelId -> { event, client }
+
+function processNextPending(channelId, client) {
+  const pending = pendingMessages.get(channelId);
+  if (pending) {
+    pendingMessages.delete(channelId);
+    log(`[BUSY] Processing queued message for #${CHANNEL_NAMES[channelId] || channelId}`);
+    handleMessage(pending.event, pending.client).catch((err) => {
+      logError(`[BUSY] Error processing queued message: ${err.message}`);
+    });
+  }
+}
+
+// ============================================================
 // CLAUDE CLI RUNNER
 // ============================================================
 
 function runClaude(prompt, sessionKey, timeoutMs = 600000, cwd = null, opts = {}) {
   return enqueueClaude(() =>
-    _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, false, opts)
+    _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, 0, opts)
   );
 }
 
-function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = {}) {
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [5000, 10000, 15000]; // escalating backoff
+
+function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, retryCount = 0, opts = {}) {
   return new Promise((resolve, reject) => {
+    // Auto-rotate session if it's gotten too long
+    if (sessionKey && shouldRotateSession(sessionKey)) {
+      log(`[SESSION] Rotating ${sessionKey} after ${MAX_SESSION_MESSAGES} messages`);
+      clearSession(sessionKey);
+    }
+
     const existingSession =
-      sessionKey && !isRetry ? getSessionId(sessionKey) : null;
+      sessionKey && retryCount === 0 ? getSessionId(sessionKey) : null;
 
     const tools = opts.tools || "Bash,Read,Write,Edit,Glob,Grep";
+    const budget = opts.budget || "1.00";
+    // Prompt is sent via stdin (not argv) so user text starting with "--"
+    // isn't mis-parsed by Claude CLI's argparser (e.g. "--prod" collapsing
+    // into "--print/--resume" prefix matches and eating later args).
     const args = [
       "-p",
-      prompt,
       "--allowedTools",
       tools,
       "--output-format",
       "json",
+      "--max-budget-usd",
+      budget,
     ];
 
     if (opts.model) args.push("--model", opts.model);
@@ -398,12 +506,15 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = 
       args.push("--resume", existingSession);
     }
 
+    log(`[CLAUDE] Starting (attempt ${retryCount + 1}/${MAX_RETRIES + 1}, budget: $${budget}, session: ${existingSession ? "resume" : "new"}, key: ${sessionKey})`);
+
     const proc = spawn(CLAUDE_PATH, args, {
       cwd: cwd || os.homedir(),
       env: { ...process.env, HOME: os.homedir() },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    proc.stdin.write(prompt);
     proc.stdin.end();
 
     const timer = setTimeout(() => {
@@ -419,11 +530,27 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = 
     proc.on("close", (code) => {
       clearTimeout(timer);
 
+      // Helper: retry with backoff if attempts remain
+      const maybeRetry = (reason) => {
+        if (retryCount < MAX_RETRIES) {
+          const delay = RETRY_DELAYS[retryCount] || 15000;
+          log(`[CLAUDE] ${reason} for ${sessionKey}, retry ${retryCount + 1}/${MAX_RETRIES} in ${delay / 1000}s...`);
+          if (sessionKey) clearSession(sessionKey);
+          setTimeout(() => {
+            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, retryCount + 1, opts)
+              .then(resolve)
+              .catch(reject);
+          }, delay);
+          return true;
+        }
+        return false;
+      };
+
       // Killed by timeout
       if (code === 143 || code === null) {
-        reject(
-          new Error("Request timed out. Try a simpler question or try again.")
-        );
+        if (!maybeRetry("Timeout")) {
+          reject(new Error("Request timed out after multiple attempts. Try a simpler request."));
+        }
         return;
       }
 
@@ -445,39 +572,34 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = 
       }
 
       if (result) {
-        // Save session ID for future resume
+        // Save session ID and increment message count for rotation tracking
         if (sessionKey && result.session_id) {
           setSessionId(sessionKey, result.session_id);
+          const count = incrementSessionCount(sessionKey);
+          if (count >= MAX_SESSION_MESSAGES - 3) {
+            log(`[SESSION] ${sessionKey} at ${count}/${MAX_SESSION_MESSAGES} messages — rotating soon`);
+          }
         }
 
         if (result.is_error) {
-          // If resume failed, retry as new session
-          if (!isRetry && existingSession) {
-            log(
-              `Session resume failed for ${sessionKey}, starting fresh`
-            );
-            clearSession(sessionKey);
-            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true, opts)
-              .then(resolve)
-              .catch(reject);
+          const errorMsg = result.result || "Claude returned an error";
+          log(`[CLAUDE] Error response: ${errorMsg}`);
+
+          // Retry on API errors or session resume failures
+          const isRetryable = /no_text|overloaded|rate_limit|internal_error|server_error|capacity/i.test(errorMsg)
+            || existingSession; // session resume failures are always retryable
+
+          if (isRetryable && maybeRetry(`API error: ${errorMsg}`)) {
             return;
           }
-          reject(new Error(result.result || "Claude returned an error"));
+          reject(new Error(errorMsg));
         } else {
           resolve(result.result || "");
         }
       } else {
         // Could not parse JSON at all
         if (code !== 0 && !stdout.trim()) {
-          // Resume might have failed — retry as new session
-          if (!isRetry && existingSession) {
-            log(
-              `Session resume failed for ${sessionKey} (code ${code}), starting fresh`
-            );
-            clearSession(sessionKey);
-            _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, true, opts)
-              .then(resolve)
-              .catch(reject);
+          if (maybeRetry(`Non-zero exit (code ${code})`)) {
             return;
           }
           reject(new Error(stderr || `claude exited with code ${code}`));
@@ -500,6 +622,30 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, isRetry, opts = 
 
 const FORMATTING_RULES = `SLACK FORMATTING: *bold* (not **), _italic_, \`code\`, \`\`\`blocks\`\`\`. No markdown tables/headings. Links: <url|text>. Bullets: •. Only emojis: ✅ ❌. Be concise.`;
 
+// Hard rules for any answer that quotes a dollar figure to a CS rep or
+// provider. Born from the SapSap thread (Apr 2026) where the bot dumped
+// 1,500 words on sweep schedules, 3-day windows, and FIFO logic — none
+// of which a provider could act on. Provider-facing answers must lead
+// with the number, qualify the timeframe + scope (so nobody reads "1
+// month" as "calendar April"), and stop. Drill-downs only on request.
+const NUMBER_ANSWER_RULES = `
+NUMBER-QUOTING RULES (when answering anything that includes a $ amount):
+1. *Lead with the number, qualified by timeframe + scope.* Format:
+   "*$X,XXX.XX* — <metric>, <date range>, <location/provider scope>."
+   e.g. "*$9,375.06* — Net Revenue, Apr 1–28 2026 (calendar April), SapSap all locations."
+2. *State the timeframe explicitly* (calendar month vs rolling 30 days vs week, etc.).
+   The dashboard's "1M" pill = LAST 30 DAYS, not calendar month — say so.
+3. *Cap the answer at ~120 words* unless the user explicitly asks for a breakdown.
+   No background on sweep schedules, 3-day settlement windows, FIFO, dynamic
+   reserves, or compliance unless asked. Those go behind a one-line
+   "_Reply 'breakdown' for the full settlement walkthrough._" footer.
+4. *Never compare two numbers without flagging timeframe alignment.* If
+   provider asks "why is dashboard $X but report $Y," check whether the
+   two surfaces use the same date window before explaining anything else.
+5. *Reconciliation always shows provenance:* POS gross, ghost refunds
+   excluded, Stripe processing fees, payouts to bank — in that order, on
+   separate lines. No multi-paragraph prose.`;
+
 function buildSystemPrompt(channelId) {
   const channelName = CHANNEL_NAMES[channelId] || "direct-message";
   const channelMemPath = ensureChannelMemory(channelId);
@@ -509,6 +655,7 @@ Eventini = event planning marketplace (hosts + providers). Firebase: eventini-74
 Projects: EventiniMockUp (RN mobile), EVENTINI-MARKETPLACE (Next.js/Vercel), eventini-admin (Next.js), EventiniPOS_local (RN POS), Pina-Eventini (Vite).
 Memory: read ${GLOBAL_MEMORY} and ${channelMemPath} for context. Update after significant tasks.
 ${FORMATTING_RULES}
+${NUMBER_ANSWER_RULES}
 Answer directly. Full system access.`;
 }
 
@@ -711,6 +858,7 @@ async function runScheduledReport(reportName) {
       model: MODEL_SONNET,
       maxTurns: 5,
       tools: "Bash,Read,Glob,Grep",
+      budget: "2.00",
     });
 
     if (reportName === "pos-report" && response.includes("===SPLIT===")) {
@@ -734,15 +882,12 @@ async function runScheduledReport(reportName) {
 // Clear all sessions daily at 7:50am — prevents context from ballooning over days
 cron.schedule("50 7 * * *", () => {
   fs.writeFileSync(SESSIONS_FILE, "{}");
-  log("Sessions cleared for new day");
+  fs.writeFileSync(SESSION_COUNTS_FILE, "{}");
+  log("Sessions and message counts cleared for new day");
 });
 
-cron.schedule("0 8 * * *", () => {
-  setTimeout(() => runScheduledReport("health-report"), 0);
-  setTimeout(() => runScheduledReport("cloud-report"), 3 * 60 * 1000);
-  setTimeout(() => runScheduledReport("pos-report"), 6 * 60 * 1000);
-  setTimeout(() => runScheduledReport("event-report"), 9 * 60 * 1000);
-});
+// 8am daily reports removed — they spawned Claude sessions that failed/timed out.
+// Use /report <name> in Slack to run reports on demand instead.
 
 // New event detection is now handled by Firebase Cloud Functions (notifySlackOnNewEvent)
 // No more Claude-powered polling — Firestore trigger fires instantly on event creation
@@ -777,6 +922,14 @@ async function handleMessage(event, client) {
   if (isDuplicate(event.channel, event.ts)) return;
 
   const channel = event.channel;
+
+  // If this channel is already processing a Claude request, queue the message
+  // instead of starting a second parallel process that may timeout or conflict
+  if (busyChannels.has(channel)) {
+    log(`[BUSY] #${CHANNEL_NAMES[channel] || channel} is busy, queuing message: "${(event.text || "").slice(0, 60)}"`);
+    pendingMessages.set(channel, { event, client });
+    return;
+  }
   let text = (event.text || "").trim();
 
   // Strip bot @mention from text
@@ -868,6 +1021,7 @@ async function handleMessage(event, client) {
   // ---- BUILDER CHANNELS ----
   const builder = BUILDER_CHANNELS[channel];
   if (builder) {
+    busyChannels.add(channel);
     await client.chat.postMessage({
       channel,
       text: `_Working on ${builder.projectName}..._`,
@@ -877,6 +1031,35 @@ async function handleMessage(event, client) {
       const sessionKey = `builder:${channel}`;
       const hasSession = !!getSessionId(sessionKey);
 
+      // On a NEW session, sync the working tree with origin before letting
+      // Claude edit. Prevents the "Claw pushes and reverts the latest
+      // upstream commit" failure mode. We `fetch --prune`, clear any
+      // stale .git/index.lock (iCloud File Provider sometimes leaves one),
+      // then `pull --rebase --autostash` so local-uncommitted edits
+      // re-apply on top of origin. If the rebase conflicts, we bail out
+      // loud — the user can resolve manually.
+      if (!hasSession && builder.projectPath) {
+        try {
+          const lockPath = `${builder.projectPath}/.git/index.lock`;
+          await fs.promises.rm(lockPath, { force: true }).catch(() => {});
+          await new Promise((resolve, reject) => {
+            const child = require("child_process").exec(
+              "git fetch --prune && git pull --rebase --autostash",
+              { cwd: builder.projectPath, timeout: 60000 },
+              (err, _stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve()),
+            );
+            child?.on?.("error", reject);
+          });
+          log(`[builder-sync] ${builder.name}: fetched + pulled origin`);
+        } catch (syncErr) {
+          logError(`[builder-sync] ${builder.name} failed:`, syncErr.message);
+          await client.chat.postMessage({
+            channel,
+            text: `:warning: Couldn't auto-sync ${builder.projectName} with origin: \`${syncErr.message}\`\nProceeding anyway — fix manually and retry if needed.`,
+          });
+        }
+      }
+
       // If resuming, just send user text. If new, send full builder prompt.
       const prompt = hasSession
         ? text
@@ -885,14 +1068,17 @@ async function handleMessage(event, client) {
       const response = await runClaude(
         prompt,
         sessionKey,
-        600000,
+        900000, // 15 min for builder tasks (code changes take longer)
         builder.projectPath,
-        {} // Builder uses default model (Opus) for code quality
+        { budget: "5.00" } // Builder needs higher budget for multi-file code changes
       );
       await reply(response);
     } catch (err) {
       logError(`Builder error (${builder.name}):`, err.message);
       await reply(`❌ Build failed: ${err.message}`);
+    } finally {
+      busyChannels.delete(channel);
+      processNextPending(channel, client);
     }
     return;
   }
@@ -960,6 +1146,7 @@ async function handleMessage(event, client) {
     }
 
     // Unrecognized — treat as custom report request
+    busyChannels.add(channel);
     await client.chat.postMessage({
       channel,
       text: "_Generating custom report..._",
@@ -974,6 +1161,9 @@ async function handleMessage(event, client) {
       await reply(response);
     } catch (err) {
       await reply(`❌ Custom report failed: ${err.message}`);
+    } finally {
+      busyChannels.delete(channel);
+      processNextPending(channel, client);
     }
     return;
   }
@@ -990,6 +1180,7 @@ async function handleMessage(event, client) {
   }
 
   // ---- GENERAL CHAT (all channels + DMs) ----
+  busyChannels.add(channel);
   try {
     await client.chat.postMessage({
       channel,
@@ -1011,6 +1202,9 @@ async function handleMessage(event, client) {
   } catch (err) {
     logError("Claude error:", err.message);
     await reply(`❌ Error: ${err.message}`);
+  } finally {
+    busyChannels.delete(channel);
+    processNextPending(channel, client);
   }
 }
 
@@ -1172,9 +1366,9 @@ async function pollNextChannel() {
   }
 }
 
-// Poll 1 channel every 1 second
-// With ~13 channels, full cycle = ~13 seconds, ~60 calls/min (within Slack limits)
-setInterval(pollNextChannel, 1000);
+// Poll 1 channel every 3 seconds
+// With ~13 channels, full cycle = ~39 seconds, ~20 calls/min (well within Slack limits)
+setInterval(pollNextChannel, 3000);
 
 // ============================================================
 // STARTUP
