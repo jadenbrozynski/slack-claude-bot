@@ -485,7 +485,7 @@ function _runClaudeInternal(prompt, sessionKey, timeoutMs, cwd, retryCount = 0, 
       sessionKey && retryCount === 0 ? getSessionId(sessionKey) : null;
 
     const tools = opts.tools || "Bash,Read,Write,Edit,Glob,Grep";
-    const budget = opts.budget || "1.00";
+    const budget = opts.budget || "5.00";
     // Prompt is sent via stdin (not argv) so user text starting with "--"
     // isn't mis-parsed by Claude CLI's argparser (e.g. "--prod" collapsing
     // into "--print/--resume" prefix matches and eating later args).
@@ -858,7 +858,7 @@ async function runScheduledReport(reportName) {
       model: MODEL_SONNET,
       maxTurns: 5,
       tools: "Bash,Read,Glob,Grep",
-      budget: "2.00",
+      budget: "10.00",
     });
 
     if (reportName === "pos-report" && response.includes("===SPLIT===")) {
@@ -1070,7 +1070,7 @@ async function handleMessage(event, client) {
         sessionKey,
         900000, // 15 min for builder tasks (code changes take longer)
         builder.projectPath,
-        { budget: "5.00" } // Builder needs higher budget for multi-file code changes
+        { budget: "25.00" } // Builder needs higher budget for multi-file code changes
       );
       await reply(response);
     } catch (err) {
@@ -1388,6 +1388,16 @@ setInterval(pollNextChannel, 3000);
 
   // Initialize polling state
   await initPollState();
+
+  // Live POS support sessions — Firestore listener + Block Kit
+  // interactive cards (Take Over / Open Simulator / End + remote
+  // command palette). Logs and no-ops gracefully if SUPPORT_CHANNEL
+  // env var isn't set.
+  try {
+    require("./support-sessions").init({ logger: log, errorLogger: logError, slackApp: app });
+  } catch (e) {
+    logError("[support] init failed:", e.message);
+  }
 
   log("");
   log("EventiniClaw Slack Bot is running!");
