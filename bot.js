@@ -104,6 +104,12 @@ const TEMP_DIR = path.join(os.tmpdir(), "slack-claude-bot");
 // Model tiering — save tokens by using cheaper models where possible
 const MODEL_HAIKU = "haiku";
 const MODEL_SONNET = "sonnet";
+// Opus 4.8 (latest, most capable) — used for ALL channel responses. The
+// "opus" alias resolves to the newest Opus so this stays current.
+const MODEL_OPUS = "opus";
+// Every channel response uses Opus 4.8. Kept as a single constant so the
+// tier can be dialed back per-surface later without hunting call sites.
+const MODEL_DEFAULT = MODEL_OPUS;
 
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -855,7 +861,7 @@ async function runScheduledReport(reportName) {
     const prompt = loadPrompt(reportName);
     // Reports: sonnet + max 5 turns, read-only tools
     const response = await runClaude(prompt, null, 600000, null, {
-      model: MODEL_SONNET,
+      model: MODEL_DEFAULT,
       maxTurns: 5,
       tools: "Bash,Read,Glob,Grep",
       budget: "10.00",
@@ -908,6 +914,74 @@ const REPORT_MENU = `*Choose a report to run:*
 Reply with the name or number.`;
 
 const pendingReportSelections = new Map();
+
+// ============================================================
+// KNOWLEDGEBASE SYNC — keep a builder's project repo current with origin
+// ============================================================
+// Runs before every builder request. Returns:
+//   { status: "ok",       message }               — up to date / fast-forwarded
+//   { status: "conflict", message, proposedFix }  — rebase conflict, tree restored, HALT
+//   { status: "error",    message, proposedFix }  — transient (network/auth), proceed stale
+function _execIn(cwd, cmd, timeout = 60000) {
+  return new Promise((resolve) => {
+    require("child_process").exec(cmd, { cwd, timeout }, (err, stdout, stderr) =>
+      resolve({ code: err ? (err.code || 1) : 0, stdout: (stdout || "").trim(), stderr: (stderr || "").trim() }),
+    );
+  });
+}
+
+async function syncBuilderRepo(projectPath, projectName) {
+  // Clear a stale lock (iCloud/File-Provider sometimes leaves one behind).
+  await fs.promises.rm(`${projectPath}/.git/index.lock`, { force: true }).catch(() => {});
+
+  const fetch = await _execIn(projectPath, "git fetch --prune");
+  if (fetch.code !== 0) {
+    return {
+      status: "error",
+      message: fetch.stderr || "git fetch failed",
+      proposedFix:
+        `Likely network or GitHub-auth. Fix: \`cd ${projectPath} && git fetch\` and check the error (VPN/token/SSH). ` +
+        `Reply "retry" once it works — I'm continuing on the local copy for now.`,
+    };
+  }
+
+  const pull = await _execIn(projectPath, "git pull --rebase --autostash");
+  if (pull.code === 0) {
+    return { status: "ok", message: pull.stdout.split("\n").slice(-1)[0] || "up to date" };
+  }
+
+  // Non-zero pull — decide conflict vs transient.
+  const blob = `${pull.stdout}\n${pull.stderr}`;
+  const isConflict = /CONFLICT|could not apply|Merge conflict|needs merge|patch failed|unmerged|rebase --continue/i.test(blob);
+  if (isConflict) {
+    const uMerged = await _execIn(projectPath, "git diff --name-only --diff-filter=U");
+    const files = uMerged.stdout.split("\n").filter(Boolean);
+    // Restore a clean, usable tree — never leave the repo stuck mid-rebase.
+    await _execIn(projectPath, "git rebase --abort");
+    await _execIn(projectPath, "git merge --abort").catch(() => {});
+    return {
+      status: "conflict",
+      message:
+        `Can't auto-sync *${projectName}* — the local branch and origin have conflicting changes` +
+        (files.length ? ` in: \`${files.join("`, `")}\`.` : "."),
+      proposedFix:
+        `I ran \`git rebase --abort\` so the repo is clean and usable again (nothing was lost, and I did NOT edit anything). To resolve:\n` +
+        `1. \`cd ${projectPath}\`\n` +
+        `2. \`git stash\` if you have uncommitted local edits\n` +
+        `3. \`git pull --rebase\`, fix the conflict in the file(s) above, then \`git rebase --continue\`\n` +
+        `4. \`git stash pop\` if you stashed\n` +
+        `Or tell me which side to keep (ours/theirs) and I'll resolve it for you. Reply "retry" once it's clean.`,
+    };
+  }
+
+  return {
+    status: "error",
+    message: pull.stderr || pull.stdout || "git pull failed",
+    proposedFix:
+      `Fix: \`cd ${projectPath} && git status\` to see the git state (detached HEAD, diverged, dirty tree). ` +
+      `Reply "retry" once resolved — continuing on the local copy for now.`,
+  };
+}
 
 // ============================================================
 // CORE MESSAGE HANDLER (handles ALL messages — channels, DMs, @mentions)
@@ -1031,32 +1105,26 @@ async function handleMessage(event, client) {
       const sessionKey = `builder:${channel}`;
       const hasSession = !!getSessionId(sessionKey);
 
-      // On a NEW session, sync the working tree with origin before letting
-      // Claude edit. Prevents the "Claw pushes and reverts the latest
-      // upstream commit" failure mode. We `fetch --prune`, clear any
-      // stale .git/index.lock (iCloud File Provider sometimes leaves one),
-      // then `pull --rebase --autostash` so local-uncommitted edits
-      // re-apply on top of origin. If the rebase conflicts, we bail out
-      // loud — the user can resolve manually.
-      if (!hasSession && builder.projectPath) {
-        try {
-          const lockPath = `${builder.projectPath}/.git/index.lock`;
-          await fs.promises.rm(lockPath, { force: true }).catch(() => {});
-          await new Promise((resolve, reject) => {
-            const child = require("child_process").exec(
-              "git fetch --prune && git pull --rebase --autostash",
-              { cwd: builder.projectPath, timeout: 60000 },
-              (err, _stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve()),
-            );
-            child?.on?.("error", reject);
-          });
-          log(`[builder-sync] ${builder.name}: fetched + pulled origin`);
-        } catch (syncErr) {
-          logError(`[builder-sync] ${builder.name} failed:`, syncErr.message);
-          await client.chat.postMessage({
-            channel,
-            text: `:warning: Couldn't auto-sync ${builder.projectName} with origin: \`${syncErr.message}\`\nProceeding anyway — fix manually and retry if needed.`,
-          });
+      // KNOWLEDGEBASE SYNC — on EVERY request (not just new sessions), pull
+      // the project repo from origin so Claw always works off the latest code
+      // that concurrent devs/agents have pushed between turns. On a merge /
+      // rebase CONFLICT we abort back to a clean tree, tell the channel, and
+      // propose a concrete fix, then HALT (editing a conflicted tree is worse
+      // than doing nothing). On a transient failure (network/auth) we warn +
+      // propose a fix but proceed on the local copy.
+      if (builder.projectPath) {
+        const sync = await syncBuilderRepo(builder.projectPath, builder.projectName);
+        if (sync.status === "conflict") {
+          await client.chat.postMessage({ channel, text: `:warning: ${sync.message}\n${sync.proposedFix}` });
+          busyChannels.delete(channel);
+          processNextPending(channel, client);
+          return;
+        }
+        if (sync.status === "error") {
+          await client.chat.postMessage({ channel, text: `:warning: Couldn't sync ${builder.projectName} with origin: \`${sync.message}\`\n${sync.proposedFix}` });
+          // proceed on the local copy — stale is better than nothing here
+        } else {
+          log(`[builder-sync] ${builder.name}: ${sync.message || "up to date"}`);
         }
       }
 
@@ -1070,7 +1138,7 @@ async function handleMessage(event, client) {
         sessionKey,
         900000, // 15 min for builder tasks (code changes take longer)
         builder.projectPath,
-        { budget: "25.00" } // Builder needs higher budget for multi-file code changes
+        { budget: "25.00", model: MODEL_DEFAULT } // Opus 4.8 + higher budget for multi-file code changes
       );
       await reply(response);
     } catch (err) {
@@ -1154,7 +1222,7 @@ async function handleMessage(event, client) {
     try {
       const customPrompt = `${buildSystemPrompt(channel)}\n\nThe user wants a custom report. Generate it based on their request:\n\n${text}`;
       const response = await runClaude(customPrompt, `custom:${channel}`, 600000, null, {
-        model: MODEL_SONNET,
+        model: MODEL_DEFAULT,
         maxTurns: 5,
         tools: "Bash,Read,Glob,Grep",
       });
@@ -1196,7 +1264,7 @@ async function handleMessage(event, client) {
       : `${buildSystemPrompt(channel)}\n\nUser message: ${text}`;
 
     const response = await runClaude(prompt, sessionKey, 600000, null, {
-      model: MODEL_SONNET,
+      model: MODEL_DEFAULT,
     });
     await reply(response);
   } catch (err) {
@@ -1403,10 +1471,10 @@ setInterval(pollNextChannel, 3000);
   log("EventiniClaw Slack Bot is running!");
   log("  Powered by Claude Code CLI");
   log("");
-  log("  Daily Reports (8:00 AM) — Sonnet, max 5 turns");
+  log("  Daily Reports (8:00 AM) — Opus 4.8, max 5 turns");
   log("  Transactions — Firebase webhook (zero Claude tokens)");
   log("  New Events — Firestore trigger (zero Claude tokens)");
-  log("  Chat/Builder — Sonnet");
+  log("  Chat/Builder — Opus 4.8 (all channels) + per-request repo sync");
   log("  Sessions auto-clear daily at 7:50 AM");
   log("");
 })();
